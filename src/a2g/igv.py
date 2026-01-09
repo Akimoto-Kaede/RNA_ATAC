@@ -1,0 +1,899 @@
+from .utils import default_to_self
+import pysam
+import numpy as np
+import pandas as pd
+import matplotlib.axes
+import matplotlib.pyplot as plt
+from matplotlib import patches
+import matplotlib.ticker as ticker
+import pyranges as pr
+from typing import List, Tuple, Optional, Union
+
+
+class IGV_a2g:
+    """
+    IGV-like visualization for A→G RNA editing signals on concatenated genomic intervals.
+
+    This class provides an integrated plotting framework to visualize:
+        - gene / transcript structure (concatenated blocks)
+        - per-read alignments with A / A→G sites
+        - per-base A→G ratio
+        - per-base A-site read depth
+
+    All genomic coordinates are first mapped onto a **continuous plot coordinate**
+    defined by user-specified genomic intervals, enabling compact visualization of
+    discontinuous regions (e.g. exons, PCR amplicons).
+
+    Coordinate System
+    -----------------
+    - Genomic input coordinates:
+        - 1-based, inclusive (as commonly used in BAM / TSV outputs)
+    - Internal PyRanges coordinates:
+        - 0-based, half-open
+    - Plot coordinates:
+        - 0-based, continuous across concatenated intervals
+
+    Data Requirements
+    -----------------
+    1. Per-read A→G table (from ``extract_A2G_per_read.py``)
+       Required columns:
+        - read_id
+        - chrom
+        - strand
+        - start            (1-based)
+        - end              (1-based)
+        - mapping_regions  (1-based)
+        - A_positions      (semicolon-separated genomic positions)
+        - A_to_G_positions (semicolon-separated genomic positions or empty)
+
+    2. Per-base A→G table (from ``extract_A2G_per_base.py``)
+       Required columns:
+        - chrom
+        - position       (1-based)
+        - strand
+        - total
+        - ref_count
+        - alt_count
+        - ref_ratio
+        - alt_ratio
+        - chrom_site_reads_count
+
+    Typical Workflow
+    ----------------
+    >>> igv = IGV_a2g(
+    ...     chrom="chr1",
+    ...     intervals=[(100, 200), (300, 350)],
+    ...     ref_fasta="hg38.fa",
+    ...     strand="+",
+    ...     df_A2G_per_read=df_reads,
+    ...     df_A2G_per_base=df_bases,
+    ... )
+    >>> igv.build_gene_model() \\
+    ...    .build_reads_track() \\
+    ...    .build_bases_track()
+    >>> fig = igv.plot_mod(
+    ...     figsize=(10, 8),
+    ...     show=["gene_body", "reads", "A_depth", "A2G_ratio"],
+    ...     max_reads=50,
+    ...     coverage_cutoff=0.9,
+    ...     title="A→G editing profile",
+    ... )
+
+    Built-in Track Types
+    --------------------
+    - ``gene_body`` :
+        Concatenated genomic blocks with strand direction arrow
+    - ``reads`` :
+        Individual read alignments with optional A / A→G site markers
+    - ``A_depth`` :
+        Per-base A-site read depth (scaled bar track)
+    - ``A2G_ratio`` :
+        Per-base A→G ratio (bar track)
+
+    Notes
+    -----
+    - Reads are plotted **from top to bottom**, ordered by coverage.
+    - Track layout is computed globally to avoid overlaps between tracks.
+    - This class does NOT perform alignment or variant calling; it assumes
+      all inputs are precomputed tables.
+
+    Attributes
+    ----------
+    chrom : str
+        Chromosome or transcript name.
+    intervals : list[tuple[int, int]]
+        Genomic intervals to concatenate (1-based, inclusive).
+    ref_fasta : str
+        Path to reference fasta file.
+    strand : str
+        Strand to visualize ("+" or "-").
+    coord_mapper : pyranges.PyRanges
+        Mapping from genomic coordinates to plot coordinates.
+    df_reads : pd.DataFrame
+        Original per-read A→G statistics.
+    df_bases : pd.DataFrame
+        Original per-base A→G statistics.
+    df_read_plot : pd.DataFrame
+        Plot-ready per-read data.
+    df_base_plot : pd.DataFrame
+        Plot-ready per-base data.
+    gene_length : int
+        Total length of concatenated plot coordinates.
+    """
+
+    def __init__(
+        self,
+        chrom: str,
+        intervals: List[Tuple[int, int]],
+        ref_fasta: str,
+        strand: str,
+        df_A2G_per_read: pd.DataFrame,
+        df_A2G_per_base: pd.DataFrame,
+        df_annotation: pd.DataFrame = None,
+    ):
+        self.chrom = chrom
+        self.intervals = intervals
+        self.ref_fasta = ref_fasta
+        if strand in ("+", "-"):
+            self.strand = strand
+            self.df_reads = df_A2G_per_read
+            self.df_bases = df_A2G_per_base
+        else:
+            raise ValueError("Not a valid strand symbol. (forward: '+', reverse: '-')")
+        self.df_annotation = df_annotation
+        self.coord_mapper = None
+        self.df_read_plot = None
+        self.df_base_plot = None
+        self.gene_length = None
+
+    @default_to_self(("chrom", "intervals", "ref_fasta"))
+    def build_gene_model(
+        self,
+        chrom: Optional[str] = None,
+        intervals: Optional[tuple] = None,
+        ref_fasta: Optional[str] = None,
+    ):
+        """
+        Build a concatenated gene model from multiple genomic intervals.
+
+        This method concatenates multiple genomic intervals into a single
+        continuous "plot coordinate" system. All downstream tracks
+        (reads, A-depth, A→G ratio) are mapped onto this coordinate system.
+
+        Genomic coordinates are converted as follows:
+            - Input intervals: 1-based, inclusive
+            - Internal representation: 0-based, half-open
+            - Plot coordinates: 0-based, continuous across intervals
+
+        Parameters
+        ----------
+        chrom : str, optional
+            Chromosome or transcript name.
+            If ``None``, defaults to ``self.chrom``.
+
+        intervals : list[tuple[int, int]], optional
+            Genomic intervals to concatenate.
+            Each interval is (start, end), 1-based and inclusive.
+            If ``None``, defaults to ``self.intervals``.
+
+        ref_fasta : str, optional
+            Path to reference FASTA file (with index).
+            If ``None``, defaults to ``self.ref_fasta``.
+
+        Returns
+        -------
+        self.coord_mapper : pyranges.PyRanges
+            Mapping from original genomic coordinates to continuous plot coordinates, with columns:
+                - Chromosome
+                - Start (0-based)
+                - End
+                - plot_start
+        self.gene_length : int
+            Total length of concatenated plot coordinates.
+
+        Raises
+        ------
+        ValueError
+            If any interval is invalid (start < 1 or end < start).
+        """
+
+        fa = pysam.FastaFile(ref_fasta)
+
+        A_bases = []
+        coord_mapper = []
+
+        cursor = 0  # plot coordinate cursor
+
+        for s, e in intervals:
+            if s < 1 or e < s:
+                raise ValueError(f"Invalid interval {(s, e)}")
+
+            # pysam fetch: 0-based, half-open
+            seq = fa.fetch(chrom, s - 1, e).upper()
+            length = e - s + 1
+
+            # collect A positions (plot coords)
+            for i, base in enumerate(seq):
+                if base == "A":
+                    A_bases.append(cursor + i)
+
+            coord_mapper.append(
+                {
+                    "Chromosome": chrom,
+                    "Start": s - 1,  # 0-based, half-open
+                    "End": e,
+                    "plot_start": cursor,
+                    # "plot_end": cursor + length,
+                }
+            )
+
+            cursor += length
+
+        self.coord_mapper = pr.PyRanges(pd.DataFrame(coord_mapper))
+        self.gene_length = cursor
+        return self
+
+    @default_to_self(("df_reads", "strand", "coord_mapper"))
+    def build_reads_track(
+        self,
+        df_reads: Optional[pd.DataFrame] = None,
+        strand: Optional[str] = None,
+        coord_mapper: Optional[pr.PyRanges] = None,
+    ):
+        """
+        Convert per-read A→G statistics into plot-ready read segments.
+
+        This method maps each read's genomic alignment onto the concatenated
+        plot coordinate system and computes:
+            - read segments in plot coordinates
+            - A-site positions
+            - A→G-site positions
+            - read coverage over the gene model
+
+        Only reads matching the specified strand are retained.
+
+        Parameters
+        ----------
+        df_reads : pandas.DataFrame, optional
+            Per-read A→G statistics table.
+            If ``None``, defaults to ``self.df_reads``.
+
+            Required columns:
+                - read_id
+                - chrom
+                - strand
+                - start              (1-based)
+                - end                (1-based)
+                - mapping_regions    (1-based)
+                - A_positions        (semicolon-separated, 1-based)
+                - A_to_G_positions   (semicolon-separated, 1-based or empty)
+
+        strand : str, optional
+            Strand to visualize ("+" or "-").
+            If ``None``, defaults to ``self.strand``.
+
+        coord_mapper : pyranges.PyRanges, optional
+            Coordinate mapper produced by ``build_gene_model``.
+            If ``None``, defaults to ``self.coord_mapper``.
+
+        Returns
+        -------
+        self.df_read_plot : pandas.DataFrame
+            Plot-ready per-read A→G table, with columns:
+            - read_id
+            - segments      : list of (plot_start, plot_end)
+            - A_plot        : list of plot positions
+            - A2G_plot      : list of plot positions
+            - coverage      : fraction of gene model covered by the read
+
+        Notes
+        -----
+        - Segment boundaries follow PyRanges semantics (0-based, half-open).
+        - Coverage is computed as total aligned length divided by
+          ``self.gene_length``.
+        """
+
+        df = df_reads[df_reads["strand"] == strand].copy()
+
+        # ---------- 1. build read blocks ----------
+        records = []
+        for row in df.itertuples(index=False):
+            if pd.isna(row.mapping_regions):
+                continue
+            for blk in row.mapping_regions.split(";"):
+                s, e = map(int, blk.strip("()").split(","))
+                records.append(
+                    {
+                        "Chromosome": row.chrom,
+                        "Start": s - 1,  # 0-based
+                        "End": e,  # half-open
+                        "read_id": row.read_id,
+                        "A_positions": row.A_positions,
+                        "A2G_positions": row.A_to_G_positions,
+                    }
+                )
+
+        if not records:
+            self.df_read_plot = pd.DataFrame(
+                columns=["read_id", "segments", "A_plot", "A2G_plot", "coverage"]
+            )
+            return self
+
+        gr_reads = pr.PyRanges(pd.DataFrame(records))
+
+        # ---------- 2. join with gene model ----------
+        ov = gr_reads.join(coord_mapper)
+
+        df_ov = ov.df
+
+        # ---------- 3. compute overlap & plot segments ----------
+        df_ov["ov_start"] = df_ov[["Start", "Start_b"]].max(axis=1)
+        df_ov["ov_end"] = df_ov[["End", "End_b"]].min(axis=1)
+
+        df_ov["seg_start"] = df_ov["plot_start"] + (
+            df_ov["ov_start"] - df_ov["Start_b"]
+        )
+        df_ov["seg_end"] = df_ov["plot_start"] + (df_ov["ov_end"] - df_ov["Start_b"])
+
+        # ---------- 4. aggregate per read ----------
+        records = []
+
+        for rid, sub in df_ov.groupby("read_id", sort=False):
+            segments = (
+                sub[["seg_start", "seg_end"]]
+                .sort_values("seg_start")
+                .itertuples(index=False, name=None)
+            )
+            segments = list(segments)
+            if not segments:
+                continue
+
+            A_plot, A2G_plot = [], []
+
+            for r in sub.itertuples(index=False):
+                g_start = r.ov_start + 1
+                g_end = r.ov_end
+                plot_base = r.plot_start + (r.ov_start - r.Start_b)
+
+                if pd.notna(r.A_positions):
+                    A_pos = np.fromstring(r.A_positions, sep=";", dtype=int)
+                    mask = (A_pos >= g_start) & (A_pos <= g_end)
+                    A_plot.extend(plot_base + (A_pos[mask] - g_start))
+
+                if pd.notna(r.A2G_positions):
+                    A2G_pos = np.fromstring(r.A2G_positions, sep=";", dtype=int)
+                    mask = (A2G_pos >= g_start) & (A2G_pos <= g_end)
+                    A2G_plot.extend(plot_base + (A2G_pos[mask] - g_start))
+
+            records.append(
+                dict(
+                    read_id=rid,
+                    segments=segments,
+                    A_plot=sorted(A_plot),
+                    A2G_plot=sorted(A2G_plot),
+                    coverage=sum(e - s for s, e in segments) / self.gene_length,
+                )
+            )
+
+        self.df_read_plot = pd.DataFrame(records)
+        return self
+
+    @default_to_self(("df_bases", "strand", "coord_mapper"))
+    def build_bases_track(
+        self,
+        df_bases: Optional[pd.DataFrame] = None,
+        coord_mapper: Optional[pr.PyRanges] = None,
+        strand: Optional[str] = None,
+    ):
+        """
+        Map per-base A→G statistics onto plot coordinates.
+
+        This method converts genomic per-base A→G signals into the
+        concatenated plot coordinate system using the gene model.
+
+        Only bases on the specified strand are retained.
+
+        Parameters
+        ----------
+        df_bases : pandas.DataFrame, optional
+            Per-base A→G statistics table.
+            If ``None``, defaults to ``self.df_bases``.
+
+            Required columns:
+                - chrom
+                - position            (1-based)
+                - strand
+                - total               (read depth)
+                - alt_ratio           (A→G ratio)
+
+        coord_mapper : pyranges.PyRanges, optional
+            Coordinate mapper produced by ``build_gene_model``.
+            If ``None``, defaults to ``self.coord_mapper``.
+
+        strand : str, optional
+            Strand to visualize ("+" or "-").
+            If ``None``, defaults to ``self.strand``.
+
+        Returns
+        -------
+        self.df_base_plot : pandas.DataFrame
+            Plot-ready per-base A→G table, with columns:
+            - plot_pos   : Plot coordinate (0-based)
+            - alt_ratio  : A→G ratio
+            - depth      : Read depth at the site
+
+        Notes
+        -----
+        Each genomic position is mapped independently; overlapping
+        intervals are handled via PyRanges join semantics.
+        """
+
+        df = df_bases[df_bases["strand"] == strand].copy()
+        df["Start"] = df.position - 1
+        df["End"] = df.position
+
+        gr_sites = pr.PyRanges(
+            pd.DataFrame(
+                {
+                    "Chromosome": df.chrom,
+                    "Start": df.Start,
+                    "End": df.End,
+                    "alt_ratio": df.alt_ratio,
+                    "depth": df.total,
+                }
+            )
+        )
+
+        ov = gr_sites.join(coord_mapper)
+        df_ov = ov.df.copy()
+        df_ov["plot_pos"] = df_ov.plot_start + (df_ov.Start - df_ov.Start_b)
+
+        self.df_base_plot = df_ov[["plot_pos", "alt_ratio", "depth"]]
+        return self
+
+    def plot_A2G_ratio(self, ax, df_base_plot, y=0.0, color="#DC923E"):
+        """Plot per-base A→G ratio"""
+        grid = [0.25 * 5, 0.5 * 5, 0.75 * 5, 1.0 * 5]
+        for l in grid:
+            ax.hlines(
+                l + y,
+                xmin=0,
+                xmax=self.gene_length,
+                color="grey",
+                alpha=0.3,
+                ls="--",
+                lw=1.0,
+                zorder=0.5,
+            )
+        ax.bar(
+            df_base_plot.plot_pos,
+            df_base_plot.alt_ratio * 1.5,
+            width=0.9,
+            bottom=y,
+            color=color,
+            alpha=0.7,
+            align="edge",
+        )
+        ax.hlines(
+            y,
+            xmin=0,
+            xmax=self.gene_length,
+            lw=1.0,
+            color="black",
+            alpha=0.4,
+            zorder=4,
+            clip_on=False,
+        )
+        # ax.text(-5, y + 0.5, "A→G ratio", ha="right", va="center")
+        return ax
+
+    def plot_A_depth(self, ax, df_base_plot, y=1.0, color="#04C243"):
+        """Plot per-base A depth"""
+        ax.bar(
+            df_base_plot.plot_pos,
+            5,  # df_base_plot.depth,
+            width=0.9,
+            bottom=y,
+            color=color,
+            alpha=0.7,
+            lw=1.0,
+            align="edge",
+        )
+        ax.hlines(
+            y,
+            xmin=0,
+            xmax=self.gene_length,
+            lw=1.0,
+            color="black",
+            alpha=0.4,
+            zorder=4,
+            clip_on=False,
+        )
+        # ax.text(-5, y + 0.5, "A depth", ha="right", va="center")
+        return ax
+
+    def plot_gene_body(self, ax, coord_mapper, y=3.0, color="black"):
+        """
+        Plot the concatenated gene body structure.
+
+        This track visualizes the concatenated genomic intervals as
+        filled blocks and adds a single strand-direction arrow
+        representing transcription orientation.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes
+            Axes to draw on.
+
+        coord_mapper : pyranges.PyRanges
+            Coordinate mapper produced by ``build_gene_model``.
+
+        y : float, optional
+            Vertical position of the gene body baseline.
+
+        color : str, optional
+            Color of gene body blocks and arrow.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+            The modified Axes object.
+        """
+
+        rect_height = 2
+        arrow_frac = 0.1  # 箭头长度占 block 的比例
+
+        # ---- draw all gene blocks ----
+        for row in coord_mapper.df.itertuples(index=False):
+            length = row.End - row.Start
+            ax.add_patch(
+                patches.Rectangle(
+                    (row.plot_start, y),
+                    length,
+                    rect_height,
+                    color=color,
+                    zorder=2,
+                )
+            )
+
+        # ---- decide arrow position ----
+        if self.strand == "+":
+            arrow_start = 0
+            arrow_end = arrow_frac * self.gene_length
+        elif self.strand == "-":
+            arrow_start = self.gene_length
+            arrow_end = self.gene_length - arrow_frac * self.gene_length
+        else:
+            raise ValueError
+
+        # ---- draw arrow ----
+        y_arrow = y + rect_height * 2
+        arrowprops = dict(
+            arrowstyle="-|>",
+            connectionstyle="angle",
+            color=color,
+            lw=1,
+            shrinkA=0,
+            shrinkB=0,
+            zorder=4,
+        )
+
+        ax.annotate(
+            "",
+            xy=(arrow_end, y_arrow),
+            xytext=(arrow_start, y_arrow),
+            arrowprops=arrowprops,
+            clip_on=False,
+        )
+        ax.vlines(
+            arrow_start,
+            y_arrow - 2 * rect_height,
+            y_arrow,
+            color=color,
+            lw=1,
+            zorder=4,
+            clip_on=False,
+        )
+        # ax.text(-5, y + rect_height / 2, "Gene", ha="right", va="center")
+        return ax
+
+    def plot_reads(
+        self,
+        ax: matplotlib.axes.Axes,
+        df_read_plot: pd.DataFrame,
+        y_start=2.0,
+        max_reads=None,
+        coverage_cutoff=0.9,
+        show_A=True,
+        show_A2G=True,
+        read_color="#5D93C4",
+        A_color="#228B22",
+        A2G_color="red",
+    ):
+        """
+        Plot individual read alignments with optional A and A→G markers.
+
+        Reads are plotted from top to bottom, sorted by coverage.
+        Each read is shown as one or more rectangular segments,
+        with optional markers indicating A-sites and A→G sites.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes
+            Axes to draw on.
+
+        df_read_plot : pandas.DataFrame
+            Output of ``build_reads_track``.
+
+        y_start : float, optional
+            Starting y-position (topmost read).
+
+        max_reads : int or None, optional
+            Maximum number of reads to draw.
+            If ``None``, all reads passing the coverage filter are drawn.
+
+        coverage_cutoff : float, optional
+            Minimum coverage required for a read to be plotted,
+            by default 0.9.
+
+        show_A : bool, optional
+            Whether to draw A-site markers, by default ``True``.
+
+        show_A2G : bool, optional
+            Whether to draw A→G-site markers, by default ``True``.
+
+        read_color : str, optional
+            Color of read segments.
+
+        A_color : str, optional
+            Color of A-site markers.
+
+        A2G_color : str, optional
+            Color of A→G-site markers.
+
+        Returns
+        -------
+        ax : matplotlib.axes.Axes
+            The modified Axes object.
+        """
+        df_read_plot = df_read_plot.sort_values(
+            "coverage", ascending=False, ignore_index=False
+        )
+        if coverage_cutoff > 0:
+            df_read_plot = df_read_plot[df_read_plot.coverage >= coverage_cutoff]
+        if max_reads is not None:
+            df_read_plot = df_read_plot.iloc[:max_reads]
+
+        read_height = 0.3
+        site_height = 0.3
+
+        for i, row in enumerate(df_read_plot.itertuples(index=False)):
+            y = y_start - i * 0.5
+            y_mid = y + read_height / 2
+
+            # ---- draw read backbone ----
+            xs, xe = zip(*row.segments)
+            ax.hlines(
+                y_mid,
+                xmin=min(xs),
+                xmax=max(xe),
+                color="grey",
+                lw=1.0,
+                alpha=0.8,
+                zorder=1.05,
+            )
+
+            # ---- draw read segments ----
+            for s, e in row.segments:
+                ax.add_patch(
+                    patches.Rectangle(
+                        (s, y),
+                        e - s,
+                        read_height,
+                        color=read_color,
+                        alpha=1.0,
+                        zorder=1.1,
+                    )
+                )
+
+            # ---- draw A sites ----
+            if show_A and row.A_plot:
+                for p in row.A_plot:
+                    ax.add_patch(
+                        patches.Rectangle(
+                            (p, y + (read_height - site_height) / 2),
+                            1,
+                            site_height,
+                            color=A_color,
+                            alpha=1.0,
+                            zorder=1.2,
+                        )
+                    )
+
+            # ---- draw A→G sites ----
+            if show_A2G and row.A2G_plot:
+                for p in row.A2G_plot:
+                    ax.add_patch(
+                        patches.Rectangle(
+                            (p, y + (read_height - site_height) / 2),
+                            1,
+                            site_height,
+                            color=A2G_color,
+                            alpha=1.0,
+                            zorder=1.3,
+                        )
+                    )
+        return ax
+
+    @default_to_self(("coord_mapper", "df_read_plot", "df_base_plot"))
+    def plot_mod(
+        self,
+        coord_mapper: Optional[pr.PyRanges] = None,
+        df_read_plot: Optional[pd.DataFrame] = None,
+        df_base_plot: Optional[pd.DataFrame] = None,
+        figsize: Optional[tuple] = (8, 10),
+        title: Optional[str] = None,
+        show: Optional[Union[list, tuple]] = (
+            "gene_body",
+            "reads",
+            "A_depth",
+            "A2G_ratio",
+        ),
+        track_gap: Optional[float] = 3.0,
+        **kwargs,
+    ):
+        """
+        Assemble multiple visualization tracks into a single IGV-like figure.
+
+        This is the main high-level plotting interface of ``IGV_a2g``.
+        It computes a global vertical layout and draws each requested
+        track in a non-overlapping, top-to-bottom order.
+
+        Supported track types:
+            - "gene_body"
+            - "reads"
+            - "A_depth"
+            - "A2G_ratio"
+
+        Parameters
+        ----------
+        coord_mapper : pyranges.PyRanges, optional
+            Coordinate mapper for gene body plotting.
+            Defaults to ``self.coord_mapper``.
+
+        df_read_plot : pandas.DataFrame, optional
+            Plot-ready per-read table.
+            Defaults to ``self.df_read_plot``.
+
+        df_base_plot : pandas.DataFrame, optional
+            Plot-ready per-base table.
+            Defaults to ``self.df_base_plot``.
+
+        figsize : tuple, optional
+            Figure size (width, height).
+
+        title : str or None, optional
+            Figure title.
+
+        show : iterable of str, optional
+            Track types to display, in drawing order.
+
+        track_gap : float, optional
+            Vertical spacing between adjacent tracks.
+
+        **kwargs
+        --------
+        Passed to ``plot_reads``:
+            - max_reads
+            - coverage_cutoff
+            - show_A
+            - show_A2G
+            ...
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            Figure with integrated tracks according to ``show``.
+
+        Raises
+        ------
+        ValueError
+            If an unknown track type is specified in ``show``.
+
+        Notes
+        -----
+        Track heights are computed dynamically based on the number
+        of reads being plotted to ensure proper spacing.
+        """
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_visible(False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["bottom"].set_visible(False)
+        ax.yaxis.set_major_locator(ticker.NullLocator())
+        ax.xaxis.set_major_locator(ticker.NullLocator())
+        ax.xaxis.set_ticks_position("none")
+
+        # ---------- track config ----------
+        df_reads_filt = df_read_plot[
+            df_read_plot.coverage >= kwargs.get("coverage_cutoff", 0.9)
+        ]
+
+        if kwargs.get("max_reads") is not None:
+            n_drawn_reads = min(len(df_reads_filt), kwargs["max_reads"])
+        else:
+            n_drawn_reads = len(df_reads_filt)
+
+        track_height = {
+            "A2G_ratio": 5,
+            "A_depth": 5,
+            "gene_body": 4,
+            "reads": n_drawn_reads * 0.5,
+        }
+
+        # ---------- layout (from top to bottom) ----------
+        total_height = sum(track_height.get(name, 0) for name in show) + track_gap * (
+            len(show) - 1
+        )
+
+        cursor = total_height
+        track_y = {}
+
+        for name in show:
+            h = track_height.get(name, 0)
+
+            if name == "reads":
+                # reads 使用“顶部 y”
+                track_y[name] = cursor
+            else:
+                # 其它 track 使用“底部 y”
+                track_y[name] = cursor - h
+
+            cursor -= h + track_gap
+
+        # ---------- draw ----------
+        for name in show:
+            y = track_y[name]
+
+            if name == "gene_body":
+                self.plot_gene_body(ax, coord_mapper, y=y, color="black")
+
+            elif name == "A2G_ratio":
+                self.plot_A2G_ratio(
+                    ax,
+                    df_base_plot,
+                    y=y,
+                    color="#DC923E",
+                )
+
+            elif name == "A_depth":
+                self.plot_A_depth(
+                    ax,
+                    df_base_plot,
+                    y=y,
+                    color="#228B22",
+                )
+
+            elif name == "reads":
+                self.plot_reads(
+                    ax,
+                    df_read_plot,
+                    y_start=y,
+                    max_reads=kwargs.get("max_reads"),
+                    coverage_cutoff=kwargs.get("coverage_cutoff", 0.9),
+                    show_A=kwargs.get("show_A", True),
+                    show_A2G=kwargs.get("show_A2G", True),
+                )
+
+            else:
+                raise ValueError(f"Unknown track: {name}")
+
+        # ---------- axis ----------
+        ax.set_yticks([])
+        # ax.set_xlabel("Plot coordinate (0-based)")
+        ax.set_xlim(0, self.gene_length)
+        ax.set_title(title)
+
+        plt.tight_layout()
+        return fig
