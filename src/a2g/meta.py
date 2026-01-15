@@ -162,9 +162,6 @@ class meta_a2g:
     def select_repr_rnas(
         self,
         df_annotation: Optional[pd.DataFrame] = None,
-        *,
-        prefer_mane: bool = True,
-        prefer_basic: bool = True,
     ):
         """
         Select one representative transcript per gene.
@@ -172,25 +169,12 @@ class meta_a2g:
         For each gene, exactly one transcript is retained according to
         the following priority rules:
 
-        Priority
-        --------
-        1. MANE_Select transcript
-        2. Transcripts tagged as "basic"
-        3. Transcript with the largest total exon length
-
-        Only transcripts annotated as ***protein_coding*** are considered.
+        Transcripts tagged as **"Ensembl_canonical"** and **"protein_coding"**.
 
         Parameters
         ----------
         df_annotation : pandas.DataFrame | None, optional
             GTF-like annotation table. If ``None``, uses ``self.df_annotation``.
-
-        prefer_mane : bool, optional
-            Whether to prioritize MANE_Select transcripts, by default True.
-
-        prefer_basic : bool, optional
-            Whether to prioritize transcripts tagged as "basic",
-            by default True.
 
         Returns
         -------
@@ -198,72 +182,25 @@ class meta_a2g:
             Containing only the selected representative transcripts.
         """
 
-        # -------- 0. 列裁剪 + 显式 copy（关键） --------
         df = df_annotation.loc[
             :, ["chrom", "start", "end", "strand", "feature", "attr"]
         ].copy()
 
-        # -------- 1. 染色体 & 基因过滤 --------
+        # ---- filters ----
         if self.exclude_chrom is not None:
             df = df.loc[~df.chrom.isin(self.exclude_chrom)]
+
         df = df.loc[
             df["attr"].str.contains('transcript_type "protein_coding"', na=False)
+            & df["attr"].str.contains("Ensembl_canonical", na=False)
         ]
 
-        # -------- 2. 向量化解析 gene_id / transcript_id（避免 apply） --------
+        # ---- parse ids ----
         df["gene_id"] = df["attr"].str.extract(r'gene_id "([^"]+)"', expand=False)
         df["transcript_id"] = df["attr"].str.extract(
             r'transcript_id "([^"]+)"', expand=False
         )
-
-        # -------- 3. exon 子集（再次 copy，后面要写列） --------
-        df_exon = df.loc[df.feature == "exon"].copy()
-        df_exon["attr"] = df_exon["attr"].fillna("")
-
-        # -------- 4. exon_len --------
-        exon_len = (
-            df_exon.assign(exon_len=df_exon.end - df_exon.start + 1)
-            .groupby(["gene_id", "transcript_id"], sort=False, observed=True)[
-                "exon_len"
-            ]
-            .sum()
-            .reset_index()
-        )
-
-        selected_tx: set[str] = set()
-
-        # -------- 5. MANE_Select --------
-        if prefer_mane:
-            mane_tx = df_exon.loc[
-                df_exon["attr"].str.contains("MANE_Select", na=False),
-                "transcript_id",
-            ].unique()
-            selected_tx.update(mane_tx)
-
-        # -------- 6. basic（排除已选） --------
-        if prefer_basic:
-            basic_tx = df_exon.loc[
-                df_exon["attr"].str.contains('tag "basic"', na=False),
-                "transcript_id",
-            ].unique()
-            selected_tx.update(set(basic_tx) - selected_tx)
-
-        # -------- 7. 剩余基因 → 最长转录本 --------
-        if selected_tx:
-            used_genes = exon_len.loc[
-                exon_len.transcript_id.isin(selected_tx), "gene_id"
-            ]
-            remaining = exon_len.loc[~exon_len.gene_id.isin(used_genes)]
-        else:
-            remaining = exon_len
-
-        if not remaining.empty:
-            idx = remaining.groupby("gene_id", sort=False)["exon_len"].idxmax()
-            selected_tx.update(remaining.loc[idx, "transcript_id"])
-
-        # -------- 8. 回写 annotation --------
-        self.df_annotation = df.loc[df.transcript_id.isin(selected_tx)]
-
+        self.df_annotation = df
         return self
 
     def build_exon_index(self):

@@ -7,7 +7,10 @@ import matplotlib.pyplot as plt
 from matplotlib import patches
 import matplotlib.ticker as ticker
 import pyranges as pr
-from typing import List, Tuple, Optional, Union
+from typing import List, Tuple, Dict, Optional, Union
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class IGV_a2g:
@@ -63,10 +66,10 @@ class IGV_a2g:
     >>> igv = IGV_a2g(
     ...     chrom="chr1",
     ...     intervals=[(100, 200), (300, 350)],
-    ...     ref_fasta="hg38.fa",
     ...     strand="+",
     ...     df_A2G_per_read=df_reads,
     ...     df_A2G_per_base=df_bases,
+    ...     df_annotation=df_anno,
     ... )
     >>> igv.build_gene_model() \\
     ...    .build_reads_track() \\
@@ -77,6 +80,7 @@ class IGV_a2g:
     ...     max_reads=50,
     ...     coverage_cutoff=0.9,
     ...     title="A→G editing profile",
+    ...     show_intervals=True,
     ... )
 
     Built-in Track Types
@@ -103,8 +107,6 @@ class IGV_a2g:
         Chromosome or transcript name.
     intervals : list[tuple[int, int]]
         Genomic intervals to concatenate (1-based, inclusive).
-    ref_fasta : str
-        Path to reference fasta file.
     strand : str
         Strand to visualize ("+" or "-").
     coord_mapper : pyranges.PyRanges
@@ -113,6 +115,10 @@ class IGV_a2g:
         Original per-read A→G statistics.
     df_bases : pd.DataFrame
         Original per-base A→G statistics.
+    df_annotation : pd.DataFrame
+        Preprocessed genomic annotation table for plotting gene body.
+    gene_model : dict[str:list[tuple[int, int]]]
+        Plot-ready gene structure data.
     df_read_plot : pd.DataFrame
         Plot-ready per-read data.
     df_base_plot : pd.DataFrame
@@ -125,7 +131,6 @@ class IGV_a2g:
         self,
         chrom: str,
         intervals: List[Tuple[int, int]],
-        ref_fasta: str,
         strand: str,
         df_A2G_per_read: pd.DataFrame,
         df_A2G_per_base: pd.DataFrame,
@@ -133,7 +138,6 @@ class IGV_a2g:
     ):
         self.chrom = chrom
         self.intervals = intervals
-        self.ref_fasta = ref_fasta
         if strand in ("+", "-"):
             self.strand = strand
             self.df_reads = df_A2G_per_read
@@ -142,54 +146,137 @@ class IGV_a2g:
             raise ValueError("Not a valid strand symbol. (forward: '+', reverse: '-')")
         self.df_annotation = df_annotation
         self.coord_mapper = None
+        self.gene_model = None
         self.df_read_plot = None
         self.df_base_plot = None
         self.gene_length = None
 
-    @default_to_self(("chrom", "intervals", "ref_fasta"))
+    @default_to_self(("df_annotation",))
+    def select_repr_rnas(
+        self,
+        df_annotation: Optional[pd.DataFrame] = None,
+    ):
+        """
+        Select one representative transcript per gene.
+
+        For each gene, exactly one transcript is retained according to
+        the following priority rules:
+
+        Transcripts tagged as **"Ensembl_canonical"** and **"protein_coding"**.
+
+        Parameters
+        ----------
+        df_annotation : pandas.DataFrame | None, optional
+            GTF-like annotation table. If ``None``, uses ``self.df_annotation``.
+
+        Returns
+        -------
+        self.df_annotation : pandas.DataFrame
+            Containing only the selected representative transcripts.
+        """
+
+        df = df_annotation.loc[
+            :, ["chrom", "start", "end", "strand", "feature", "attr"]
+        ].copy()
+
+        # ---- filters ----
+        if self.exclude_chrom is not None:
+            df = df.loc[~df.chrom.isin(self.exclude_chrom)]
+
+        df = df.loc[
+            df["attr"].str.contains('transcript_type "protein_coding"', na=False)
+            & df["attr"].str.contains("Ensembl_canonical", na=False)
+        ]
+
+        # ---- parse ids ----
+        df["gene_id"] = df["attr"].str.extract(r'gene_id "([^"]+)"', expand=False)
+        df["transcript_id"] = df["attr"].str.extract(
+            r'transcript_id "([^"]+)"', expand=False
+        )
+        self.df_annotation = df
+        return self
+
+    @default_to_self(("chrom", "intervals", "strand", "df_annotation"))
     def build_gene_model(
         self,
         chrom: Optional[str] = None,
-        intervals: Optional[tuple] = None,
-        ref_fasta: Optional[str] = None,
+        intervals: Optional[List[tuple[int, int]]] = None,
+        strand: Optional[str] = None,
+        df_annotation: Optional[pd.DataFrame] = None,
     ):
         """
-        Build a concatenated gene model from multiple genomic intervals.
+        Build an IGV-like gene body model on concatenated plot coordinates.
 
-        This method concatenates multiple genomic intervals into a single
-        continuous "plot coordinate" system. All downstream tracks
-        (reads, A-depth, A→G ratio) are mapped onto this coordinate system.
+        This method projects gene annotation features onto a continuous
+        "plot coordinate" system constructed by concatenating multiple
+        genomic intervals. The resulting gene model is intended for
+        visualization (e.g. by :meth:`plot_gene_body`) rather than
+        biological inference.
 
-        Genomic coordinates are converted as follows:
-            - Input intervals: 1-based, inclusive
-            - Internal representation: 0-based, half-open
-            - Plot coordinates: 0-based, continuous across intervals
+        The workflow consists of:
+
+        1. Constructing a coordinate mapper that concatenates the provided
+           genomic intervals into a single continuous axis.
+        2. Filtering annotation records by strand.
+        3. Projecting annotation features onto the concatenated coordinates
+           using interval overlap.
+        4. Collecting CDS, UTR, start_codon and stop_codon features directly.
+        5. Inferring intron intervals *within each transcript* from exon
+           ordering in plot coordinates.
+        6. Deduplicating and sorting all feature intervals.
+
+        Notes
+        -----
+        - Exons are **not** included in the final gene model.
+          Introns are inferred from exon gaps within each transcript.
+        - Coordinates in the gene model are in **plot coordinates**
+          (0-based, half-open), not genomic coordinates.
+        - If annotation does not overlap the concatenated intervals,
+          the gene model is skipped with corresponding info.
+        - This function does not raise on missing annotations; it logs
+          informative messages instead.
+
+        Coordinate conventions
+        ----------------------
+        - Input genomic intervals: 1-based, inclusive
+        - Internal representation: 0-based, half-open
+        - Plot coordinates: 0-based, continuous across all intervals
 
         Parameters
         ----------
         chrom : str, optional
-            Chromosome or transcript name.
+            Chromosome name corresponding to the genomic intervals.
             If ``None``, defaults to ``self.chrom``.
 
         intervals : list[tuple[int, int]], optional
-            Genomic intervals to concatenate.
-            Each interval is (start, end), 1-based and inclusive.
+            Genomic intervals to concatenate, each given as
+            ``(start, end)`` in 1-based inclusive coordinates.
             If ``None``, defaults to ``self.intervals``.
 
-        ref_fasta : str, optional
-            Path to reference FASTA file (with index).
-            If ``None``, defaults to ``self.ref_fasta``.
+        strand : str, optional
+            Strand used to filter annotation records.
+            If ``None``, defaults to ``self.strand``.
+
+        df_annotation : pandas.DataFrame, optional
+            Pre-filtered annotation table. Must contain at least the
+            following columns::
+
+                chrom, start, end, strand, feature, transcript_id
+
+            Coordinates are assumed to be 1-based and inclusive.
 
         Returns
         -------
         self.coord_mapper : pyranges.PyRanges
-            Mapping from original genomic coordinates to continuous plot coordinates, with columns:
-                - Chromosome
-                - Start (0-based)
-                - End
-                - plot_start
+            Mapping from genomic coordinates to plot coordinates.
         self.gene_length : int
             Total length of concatenated plot coordinates.
+        self.gene_model : dict[str, list[tuple[int, int]]]
+            Gene body model with keys::
+
+                "CDS", "UTR", "intron", "start_codon", "stop_codon"
+
+            Each value is a list of (plot_start, plot_end) tuples.
 
         Raises
         ------
@@ -197,27 +284,16 @@ class IGV_a2g:
             If any interval is invalid (start < 1 or end < start).
         """
 
-        fa = pysam.FastaFile(ref_fasta)
-
-        A_bases = []
-        coord_mapper = []
-
+        # ---------- coordinate mapper ----------
+        coord_mapper_record = []
         cursor = 0  # plot coordinate cursor
 
         for s, e in intervals:
             if s < 1 or e < s:
                 raise ValueError(f"Invalid interval {(s, e)}")
 
-            # pysam fetch: 0-based, half-open
-            seq = fa.fetch(chrom, s - 1, e).upper()
             length = e - s + 1
-
-            # collect A positions (plot coords)
-            for i, base in enumerate(seq):
-                if base == "A":
-                    A_bases.append(cursor + i)
-
-            coord_mapper.append(
+            coord_mapper_record.append(
                 {
                     "Chromosome": chrom,
                     "Start": s - 1,  # 0-based, half-open
@@ -226,11 +302,97 @@ class IGV_a2g:
                     # "plot_end": cursor + length,
                 }
             )
-
             cursor += length
-
-        self.coord_mapper = pr.PyRanges(pd.DataFrame(coord_mapper))
+        coord_mapper = pr.PyRanges(pd.DataFrame(coord_mapper_record))
+        self.coord_mapper = coord_mapper
         self.gene_length = cursor
+
+        # --------------------------------
+        # ---------- gene model ----------
+        if df_annotation is None:
+            logger.info(
+                "build_gene_model: df_annotation is None, skip gene body model."
+            )
+            return self
+
+        # ---------- strand filter ----------
+        df = df_annotation[df_annotation["strand"] == strand].copy()
+        if df.empty:
+            logger.info(
+                "build_gene_model: no annotation left after strand filter (%s).", strand
+            )
+            return self
+
+        # ---------- coordinate normalization ----------
+        df["Start"] = df.start - 1
+        df["End"] = df.end
+
+        # ---------- build PyRanges ----------
+        gr_anno = pr.PyRanges(
+            df.rename(columns={"chrom": "Chromosome"})[
+                [
+                    "Chromosome",
+                    "Start",
+                    "End",
+                    "feature",
+                    "transcript_id",
+                ]
+            ]
+        )
+
+        # ---------- project to concat coordinates ----------
+        ov = gr_anno.join(coord_mapper)
+        df_ov = ov.df
+
+        if df_ov.empty:
+            logger.info(
+                "build_gene_model: annotation does not overlap with concat intervals."
+            )
+            return self
+
+        # ---------- compute plot coordinates ----------
+        df_ov["ov_start"] = df_ov[["Start", "Start_b"]].max(axis=1)
+        df_ov["ov_end"] = df_ov[["End", "End_b"]].min(axis=1)
+
+        df_ov["plot_start"] = df_ov["plot_start"] + (
+            df_ov["ov_start"] - df_ov["Start_b"]
+        )
+        df_ov["plot_end"] = df_ov["plot_start"] + (df_ov["ov_end"] - df_ov["ov_start"])
+
+        # ---------- initialize gene body model ----------
+        gene_model = {
+            "CDS": [],
+            "UTR": [],
+            "intron": [],
+            "start_codon": [],
+            "stop_codon": [],
+        }
+
+        # ---------- collect CDS / UTR / codon ----------
+        for r in df_ov.itertuples(index=False):
+            if r.feature in gene_model and r.feature != "intron":
+                gene_model[r.feature].append((r.plot_start, r.plot_end))
+
+        # ---------- infer intron from exon (per transcript) ----------
+        exon_df = df_ov[df_ov.feature == "exon"]
+
+        for tid, sub in exon_df.groupby("transcript_id", sort=False):
+            if len(sub) < 2:
+                continue
+
+            # concat 坐标下，plot_start 的大小顺序就是转录顺序
+            sub = sub.sort_values("plot_start")
+
+            exons = list(zip(sub.plot_start, sub.plot_end))
+            for (s1, e1), (s2, e2) in zip(exons[:-1], exons[1:]):
+                if e1 < s2:
+                    gene_model["intron"].append((e1, s2))
+
+        # ---------- sort & deduplicate ----------
+        for k in gene_model:
+            gene_model[k] = sorted(set(gene_model[k]))
+
+        self.gene_model = gene_model
         return self
 
     @default_to_self(("df_reads", "strand", "coord_mapper"))
@@ -286,6 +448,19 @@ class IGV_a2g:
             - A2G_plot      : list of plot positions
             - coverage      : fraction of gene model covered by the read
 
+        Raises
+        ------
+        ValueError
+            If no valid mapping regions are found after filtering reads by
+            the specified strand. This usually indicates that the
+            ``mapping_regions`` column is missing, empty, or all values
+            are NaN for the selected strand.
+
+        ValueError
+            If no read segments remain after joining with ``coord_mapper``.
+            This may be caused by strand mismatch, incompatible genomic
+            intervals, or an incorrect coordinate mapper.
+
         Notes
         -----
         - Segment boundaries follow PyRanges semantics (0-based, half-open).
@@ -314,17 +489,22 @@ class IGV_a2g:
                 )
 
         if not records:
-            self.df_read_plot = pd.DataFrame(
-                columns=["read_id", "segments", "A_plot", "A2G_plot", "coverage"]
+            raise ValueError(
+                f"No valid mapping regions found in df_reads after filtering by strand '{strand}'. "
+                f"Check that 'mapping_regions' column is present and not all values are NaN."
             )
-            return self
 
         gr_reads = pr.PyRanges(pd.DataFrame(records))
 
         # ---------- 2. join with gene model ----------
         ov = gr_reads.join(coord_mapper)
-
         df_ov = ov.df
+        if df_ov.empty:
+            raise ValueError(
+                f"No reads remain after joining with the gene model. "
+                f"Check your strand filter and intervals. "
+                f"Total input reads: {len(df)}."
+            )
 
         # ---------- 3. compute overlap & plot segments ----------
         df_ov["ov_start"] = df_ov[["Start", "Start_b"]].max(axis=1)
@@ -337,7 +517,6 @@ class IGV_a2g:
 
         # ---------- 4. aggregate per read ----------
         records = []
-
         for rid, sub in df_ov.groupby("read_id", sort=False):
             segments = (
                 sub[["seg_start", "seg_end"]]
@@ -371,6 +550,8 @@ class IGV_a2g:
                     segments=segments,
                     A_plot=sorted(A_plot),
                     A2G_plot=sorted(A2G_plot),
+                    five_prime=segments[0][0],
+                    three_prime=segments[-1][1],
                     coverage=sum(e - s for s, e in segments) / self.gene_length,
                 )
             )
@@ -460,18 +641,18 @@ class IGV_a2g:
                 xmin=0,
                 xmax=self.gene_length,
                 color="grey",
-                alpha=0.3,
+                alpha=0.5,
                 ls="--",
                 lw=1.0,
                 zorder=0.5,
             )
         ax.bar(
             df_base_plot.plot_pos,
-            df_base_plot.alt_ratio * 1.5,
+            df_base_plot.alt_ratio * 5,
             width=0.9,
             bottom=y,
             color=color,
-            alpha=0.7,
+            alpha=0.9,
             align="edge",
         )
         ax.hlines(
@@ -512,89 +693,258 @@ class IGV_a2g:
         # ax.text(-5, y + 0.5, "A depth", ha="right", va="center")
         return ax
 
-    def plot_gene_body(self, ax, coord_mapper, y=3.0, color="black"):
+    def plot_gene_body(
+        self,
+        ax: matplotlib.axes.Axes,
+        gene_model: Optional[Dict[str, List[Tuple[int, int]]]] = None,
+        *,
+        y: float = 3.0,
+        cds_height: float = 3.0,
+        utr_height: float = 1.5,
+        intron_height: float = 0.5,
+        body_color: str = "black",
+        utr_color: str = "black",
+        intron_color: str = "black",
+        show_codon: bool = False,
+        codon_color: str = "yellow",
+    ):
         """
-        Plot the concatenated gene body structure.
+        Plot an IGV-like gene body track on concatenated plot coordinates.
 
-        This track visualizes the concatenated genomic intervals as
-        filled blocks and adds a single strand-direction arrow
-        representing transcription orientation.
+        This method visualizes a gene model composed of CDS, UTR, intron,
+        start_codon and stop_codon features using a compact, IGV-style
+        representation. Directional arrows are rendered directly on CDS
+        and intron regions to indicate transcription direction.
+
+        The function assumes all coordinates in ``gene_model`` are already
+        mapped to the continuous plot coordinate system produced by
+        :meth:`build_gene_model`.
+
+        Rendering overview
+        ------------------
+        Features are drawn in the following order (from back to front layer):
+
+        1. Introns
+           Rendered as thinnest rectangles centered at ``y``.
+        2. CDS
+           Rendered as filled rectangles centered at ``y``.
+        3. UTR
+           Rendered as thinner rectangles centered at ``y``.
+        4. Start / stop codons
+           Rendered as vertical ticks centered on CDS height.
+        5. Directional arrows
+           Rendered on CDS and intron regions to indicate strand direction.
+
+        Directional arrows
+        ------------------
+        - Arrows are placed only on CDS and intron regions.
+        - Arrow positions are uniformly spaced across the gene body.
+        - Arrow density adapts automatically to figure size to maintain
+          approximately constant visual spacing in screen pixels.
+        - If an arrow position overlaps both CDS and intron, CDS takes
+          priority.
+        - Arrow direction follows ``self.strand``.
+
+        Arrow spacing is determined by:
+        - The total gene length in plot coordinates.
+        - The rendered axis width in pixels.
+        - A minimum visual spacing (in pixels) between arrows.
+
+        Coordinate conventions
+        ----------------------
+        - All coordinates are plot coordinates (0-based, half-open).
+        - The x-axis corresponds to the concatenated genomic intervals.
+        - The y-axis is in arbitrary plotting units.
 
         Parameters
         ----------
         ax : matplotlib.axes.Axes
-            Axes to draw on.
+            Axes on which the gene body is drawn.
 
-        coord_mapper : pyranges.PyRanges
-            Coordinate mapper produced by ``build_gene_model``.
+        gene_model : dict[str, list[tuple[int, int]]], optional
+            Gene body model produced by :meth:`build_gene_model`.
+            Expected keys include::
+
+                "CDS", "UTR", "intron", "start_codon", "stop_codon"
+
+            Each value is a list of (start, end) tuples in plot coordinates.
+            If ``None`` or empty, the gene body track is skipped.
 
         y : float, optional
-            Vertical position of the gene body baseline.
+            Vertical center position of the gene body.
+            Default is 3.0.
 
-        color : str, optional
-            Color of gene body blocks and arrow.
+        cds_height : float, optional
+            Height of CDS rectangles.
+            Default is 3.0.
+
+        utr_height : float, optional
+            Height of UTR rectangles.
+            Default is 1.5.
+
+        intron_height : float, optional
+            Height of intron rectangles.
+            Default is 0.5.
+
+        body_color : str, optional
+            Fill color for CDS rectangles.
+
+        utr_color : str, optional
+            Fill color for UTR rectangles.
+
+        intron_color : str, optional
+            Fill color for intron rectangles.
+
+        show_codon : bool, optional
+            Whether to draw start and end codon markers.
+
+        codon_color : str, optional
+            Color used to draw start and stop codon markers.
 
         Returns
         -------
-        matplotlib.axes.Axes
-            The modified Axes object.
+        ax : matplotlib.axes.Axes
+            The input axes, with the gene body track rendered.
+
+        Notes
+        -----
+        - This function performs no coordinate validation.
+        - It is intended purely for visualization.
+        - Missing or empty gene models are silently skipped with logging.
         """
 
-        rect_height = 2
-        arrow_frac = 0.1  # 箭头长度占 block 的比例
+        if not gene_model:
+            logger.info("No gene model, skip gene_body track.")
+            return ax
 
-        # ---- draw all gene blocks ----
-        for row in coord_mapper.df.itertuples(index=False):
-            length = row.End - row.Start
+        # 1. draw intron
+        for s, e in gene_model.get("intron", []):
             ax.add_patch(
                 patches.Rectangle(
-                    (row.plot_start, y),
-                    length,
-                    rect_height,
-                    color=color,
+                    (s, y - intron_height / 2),
+                    e - s,
+                    intron_height,
+                    facecolor=intron_color,
+                    edgecolor="none",
+                    zorder=1,
+                )
+            )
+
+        # 2. draw CDS
+        for s, e in gene_model.get("CDS", []):
+            ax.add_patch(
+                patches.Rectangle(
+                    (s, y - cds_height / 2),
+                    e - s,
+                    cds_height,
+                    facecolor=body_color,
+                    edgecolor="none",
                     zorder=2,
                 )
             )
 
-        # ---- decide arrow position ----
-        if self.strand == "+":
-            arrow_start = 0
-            arrow_end = arrow_frac * self.gene_length
-        elif self.strand == "-":
-            arrow_start = self.gene_length
-            arrow_end = self.gene_length - arrow_frac * self.gene_length
-        else:
-            raise ValueError
+        # 3. draw UTR
+        for s, e in gene_model.get("UTR", []):
+            ax.add_patch(
+                patches.Rectangle(
+                    (s, y - utr_height / 2),
+                    e - s,
+                    utr_height,
+                    facecolor=utr_color,
+                    edgecolor="none",
+                    zorder=2,
+                )
+            )
 
-        # ---- draw arrow ----
-        y_arrow = y + rect_height * 2
-        arrowprops = dict(
-            arrowstyle="-|>",
-            connectionstyle="angle",
-            color=color,
-            lw=1,
-            shrinkA=0,
-            shrinkB=0,
-            zorder=4,
+        # 4. draw start / stop codon
+        if show_codon:
+            for key in ("start_codon", "stop_codon"):
+                for s, e in gene_model.get(key, []):
+                    x = (s + e) / 2
+                    ax.vlines(
+                        x,
+                        y - cds_height / 2,
+                        y + cds_height / 2,
+                        color=codon_color,
+                        lw=1.5,
+                        zorder=3,
+                    )
+
+        # 5. draw arrows
+        direction = 1 if self.strand == "+" else -1
+
+        # collect all CDS + intron intervals
+        arrow_intervals = []
+        for feature in ("CDS", "intron"):
+            for s, e in gene_model.get(feature, []):
+                arrow_intervals.append((s, e, feature))
+
+        if not arrow_intervals:
+            return
+
+        gene_start = min(s for s, _, _ in arrow_intervals)
+        gene_end = max(e for _, e, _ in arrow_intervals)
+        gene_len = gene_end - gene_start
+
+        # ---------- figure pixel width ----------
+        ax_width_px = ax.get_window_extent().width
+        min_spacing_px = 150  # 视觉上每个箭头至少 150px
+        bp_per_pixel = gene_len / ax_width_px
+        min_spacing_bp = min_spacing_px * bp_per_pixel
+
+        # ---------- number of arrows ----------
+        n_arrows = max(1, int(gene_len / min_spacing_bp))
+        xs = np.linspace(gene_start, gene_end, n_arrows)
+
+        # ---------- map arrows to CDS/intron ----------
+        df_feat = pd.DataFrame(arrow_intervals, columns=["Start", "End", "feature"])
+        df_feat["Chromosome"] = "plot"
+        df_feat = pr.PyRanges(df_feat[["Chromosome", "Start", "End", "feature"]])
+
+        gr_x = pr.PyRanges(
+            pd.DataFrame({"Chromosome": "plot", "Start": xs, "End": xs + 1})
+        )
+        ov = gr_x.join(df_feat)
+        if ov.df.empty:
+            return
+
+        df_arrow = ov.df[["Start", "feature"]].copy()
+        df_arrow["priority"] = df_arrow["feature"].map({"CDS": 2, "intron": 1})
+        df_arrow = df_arrow.sort_values("priority", ascending=False).drop_duplicates(
+            "Start"
         )
 
-        ax.annotate(
-            "",
-            xy=(arrow_end, y_arrow),
-            xytext=(arrow_start, y_arrow),
-            arrowprops=arrowprops,
-            clip_on=False,
-        )
-        ax.vlines(
-            arrow_start,
-            y_arrow - 2 * rect_height,
-            y_arrow,
-            color=color,
-            lw=1,
-            zorder=4,
-            clip_on=False,
-        )
-        # ax.text(-5, y + rect_height / 2, "Gene", ha="right", va="center")
+        # ---------- draw ----------
+        for r in df_arrow.itertuples(index=False):
+            x_start = r.Start
+            x_end = x_start + 0.1 * direction
+
+            if r.feature == "CDS":
+                fc = "white"
+                ec = "white"
+                z = 4
+            else:  # intron
+                fc = intron_color
+                ec = intron_color
+                z = 3
+
+            ax.annotate(
+                "",
+                xy=(x_end, y),
+                xytext=(x_start, y),
+                arrowprops=dict(
+                    arrowstyle="->",
+                    edgecolor=ec,
+                    facecolor=fc,
+                    lw=2.0,
+                    shrinkA=0,
+                    shrinkB=0,
+                    mutation_scale=25,  # 控制箭头头部大小
+                ),
+                zorder=z,
+                clip_on=False,
+            )
+
         return ax
 
     def plot_reads(
@@ -606,9 +956,9 @@ class IGV_a2g:
         coverage_cutoff=0.9,
         show_A=True,
         show_A2G=True,
-        read_color="#5D93C4",
-        A_color="#228B22",
-        A2G_color="red",
+        read_color="#6da3d6",
+        A_color="#228b22",
+        A2G_color="#bf1f1f",
     ):
         """
         Plot individual read alignments with optional A and A→G markers.
@@ -656,8 +1006,11 @@ class IGV_a2g:
         ax : matplotlib.axes.Axes
             The modified Axes object.
         """
+
         df_read_plot = df_read_plot.sort_values(
-            "coverage", ascending=False, ignore_index=False
+            by=["five_prime", "coverage"],
+            ascending=[True, False],
+            ignore_index=True,
         )
         if coverage_cutoff > 0:
             df_read_plot = df_read_plot[df_read_plot.coverage >= coverage_cutoff]
@@ -672,11 +1025,10 @@ class IGV_a2g:
             y_mid = y + read_height / 2
 
             # ---- draw read backbone ----
-            xs, xe = zip(*row.segments)
             ax.hlines(
                 y_mid,
-                xmin=min(xs),
-                xmax=max(xe),
+                xmin=row.five_prime,
+                xmax=row.three_prime,
                 color="grey",
                 lw=1.0,
                 alpha=0.8,
@@ -693,6 +1045,7 @@ class IGV_a2g:
                         color=read_color,
                         alpha=1.0,
                         zorder=1.1,
+                        antialiased=False,
                     )
                 )
 
@@ -702,11 +1055,12 @@ class IGV_a2g:
                     ax.add_patch(
                         patches.Rectangle(
                             (p, y + (read_height - site_height) / 2),
-                            1,
+                            0.86,
                             site_height,
                             color=A_color,
                             alpha=1.0,
                             zorder=1.2,
+                            antialiased=False,
                         )
                     )
 
@@ -716,19 +1070,21 @@ class IGV_a2g:
                     ax.add_patch(
                         patches.Rectangle(
                             (p, y + (read_height - site_height) / 2),
-                            1,
+                            0.86,
                             site_height,
                             color=A2G_color,
                             alpha=1.0,
                             zorder=1.3,
+                            antialiased=False,
                         )
                     )
         return ax
 
-    @default_to_self(("coord_mapper", "df_read_plot", "df_base_plot"))
+    @default_to_self(("coord_mapper", "gene_model", "df_read_plot", "df_base_plot"))
     def plot_mod(
         self,
         coord_mapper: Optional[pr.PyRanges] = None,
+        gene_model: Optional[Dict[str, List[Tuple[int, int]]]] = None,
         df_read_plot: Optional[pd.DataFrame] = None,
         df_base_plot: Optional[pd.DataFrame] = None,
         figsize: Optional[tuple] = (8, 10),
@@ -740,60 +1096,97 @@ class IGV_a2g:
             "A2G_ratio",
         ),
         track_gap: Optional[float] = 3.0,
+        show_intervals: bool = True,
         **kwargs,
     ):
         """
         Assemble multiple visualization tracks into a single IGV-like figure.
 
-        This is the main high-level plotting interface of ``IGV_a2g``.
-        It computes a global vertical layout and draws each requested
-        track in a non-overlapping, top-to-bottom order.
+        This method is the main high-level plotting interface of ``IGV_a2g``.
+        It computes a global vertical layout and renders multiple visualization
+        tracks on a shared x-axis using concatenated plot coordinates.
 
-        Supported track types:
-            - "gene_body"
-            - "reads"
-            - "A_depth"
-            - "A2G_ratio"
+        Tracks are drawn from top to bottom in the order specified by ``show``.
+        Each track occupies a dynamically computed vertical region to avoid
+        overlap while preserving an IGV-like appearance.
+
+        Supported track types
+        ---------------------
+        - ``"gene_body"`` : Gene structure (CDS / UTR / intron / codons)
+        - ``"reads"``     : Per-read alignment blocks
+        - ``"A_depth"``   : Per-base A coverage depth
+        - ``"A2G_ratio"`` : Per-base A→G editing ratio
+
+        Coordinate conventions
+        ----------------------
+        - All tracks share the same x-axis in plot coordinates.
+        - Plot coordinates are continuous and produced by concatenating
+          genomic intervals via ``coord_mapper``.
 
         Parameters
         ----------
         coord_mapper : pyranges.PyRanges, optional
-            Coordinate mapper for gene body plotting.
+            Coordinate mapper defining the concatenated plot coordinates.
             Defaults to ``self.coord_mapper``.
 
+        gene_model : dict[str, list[tuple[int, int]]], optional
+            Gene body model used by the ``gene_body`` track.
+            Defaults to ``self.gene_model``.
+
         df_read_plot : pandas.DataFrame, optional
-            Plot-ready per-read table.
+            Plot-ready per-read table used by the ``reads`` track.
             Defaults to ``self.df_read_plot``.
 
         df_base_plot : pandas.DataFrame, optional
-            Plot-ready per-base table.
+            Plot-ready per-base table used by ``A_depth`` and ``A2G_ratio`` tracks.
             Defaults to ``self.df_base_plot``.
 
         figsize : tuple, optional
-            Figure size (width, height).
+            Figure size given as ``(width, height)`` in inches.
+            Default is ``(8, 10)``.
 
         title : str or None, optional
             Figure title.
+            Default is ``None``.
 
         show : iterable of str, optional
-            Track types to display, in drawing order.
+            Track types to display, in drawing order from top to bottom.
+            Default is ``("gene_body", "reads", "A_depth", "A2G_ratio")``.
 
         track_gap : float, optional
             Vertical spacing between adjacent tracks.
+            Default is 3.0.
+
+        show_intervals : bool, optional
+            Whether to draw vertical guide lines at concatenated interval
+            boundaries.
+            Default is ``True``.
 
         **kwargs
         --------
-        Passed to ``plot_reads``:
-            - max_reads
-            - coverage_cutoff
-            - show_A
-            - show_A2G
-            ...
+        Additional keyword arguments forwarded to track-specific plotting functions.
+
+        Reads track options
+
+        - ``max_reads`` : Maximum number of reads to display. Default is ``None`` (draw all reads).
+        - ``coverage_cutoff`` : Minimum read coverage required for a read to be included. Default is ``0.9``.
+        - ``show_A`` : Whether to highlight A bases in reads. Default is ``True``.
+        - ``show_A2G`` : Whether to highlight A→G editing events in reads. Default is ``True``.
+
+
+        Gene body track options
+
+        - ``body_color`` : Fill color of CDS regions. Default is ``"black"``.
+        - ``utr_color`` : Fill color of UTR regions. Default is ``"black"``.
+        - ``intron_color`` : Color used to draw intron lines and intron arrows. Default is ``"black"``.
+        - ``show_codon`` : Whether to draw start and stop codon markers. Default is ``False``.
+        - ``codon_color`` : Color used to draw start and stop codon markers. Default is ``"yellow"``.
+
 
         Returns
         -------
         fig : matplotlib.figure.Figure
-            Figure with integrated tracks according to ``show``.
+            Figure object containing all requested tracks.
 
         Raises
         ------
@@ -802,8 +1195,11 @@ class IGV_a2g:
 
         Notes
         -----
-        Track heights are computed dynamically based on the number
-        of reads being plotted to ensure proper spacing.
+        - Track heights are computed dynamically.
+        - The height of the ``reads`` track scales with the number of reads
+          being drawn.
+        - This method does not perform coordinate validation and assumes
+          all inputs are already mapped to plot coordinates.
         """
 
         fig, ax = plt.subplots(figsize=figsize)
@@ -828,7 +1224,7 @@ class IGV_a2g:
         track_height = {
             "A2G_ratio": 5,
             "A_depth": 5,
-            "gene_body": 4,
+            "gene_body": 3,
             "reads": n_drawn_reads * 0.5,
         }
 
@@ -857,7 +1253,16 @@ class IGV_a2g:
             y = track_y[name]
 
             if name == "gene_body":
-                self.plot_gene_body(ax, coord_mapper, y=y, color="black")
+                self.plot_gene_body(
+                    ax,
+                    y=y,
+                    gene_model=gene_model,
+                    body_color=kwargs.get("body_color", "black"),
+                    utr_color=kwargs.get("utr_color", "black"),
+                    intron_color=kwargs.get("intron_color", "black"),
+                    show_codon=kwargs.get("show_codon", False),
+                    codon_color=kwargs.get("codon_color", "yellow"),
+                )
 
             elif name == "A2G_ratio":
                 self.plot_A2G_ratio(
@@ -889,9 +1294,22 @@ class IGV_a2g:
             else:
                 raise ValueError(f"Unknown track: {name}")
 
+        # ---------- draw genomic interval lines ----------
+        if show_intervals and coord_mapper is not None and not coord_mapper.df.empty:
+            interval_positions = sorted(set(coord_mapper.df["plot_start"].tolist()))[1:]
+
+            for pos in interval_positions:
+                ax.axvline(
+                    pos,
+                    color="grey",
+                    linestyle="-",
+                    lw=0.8,
+                    alpha=0.3,
+                    zorder=10,
+                )
+
         # ---------- axis ----------
         ax.set_yticks([])
-        # ax.set_xlabel("Plot coordinate (0-based)")
         ax.set_xlim(0, self.gene_length)
         ax.set_title(title)
 

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 
 authors = [
-  { name = "Zhang Yitian", email = "your_email@example.com" }
+  { name = "Zhang Yitian", email = "12433093@mail.sustech.edu.cn" }
 ]
 
 dependencies = [
