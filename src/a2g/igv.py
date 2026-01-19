@@ -1007,9 +1007,11 @@ class IGV_a2g:
             The modified Axes object.
         """
 
+        sort_col = "five_prime" if self.strand == "+" else "three_prime"
+        ascending = [self.strand == "+", False]
         df_read_plot = df_read_plot.sort_values(
-            by=["five_prime", "coverage"],
-            ascending=[True, False],
+            by=[sort_col, "coverage"],
+            ascending=ascending,
             ignore_index=True,
         )
         if coverage_cutoff > 0:
