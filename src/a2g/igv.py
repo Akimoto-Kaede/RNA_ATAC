@@ -1158,8 +1158,7 @@ class IGV_a2g:
             Default is 3.0.
 
         show_intervals : bool, optional
-            Whether to draw vertical guide lines at concatenated interval
-            boundaries.
+            Whether to draw vertical guide lines at concatenated interval boundaries.
             Default is ``True``.
 
         **kwargs
